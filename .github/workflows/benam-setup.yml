@@ -1,4 +1,4 @@
-name: Setup ilham
+name: Setup benam
 
 on:
   workflow_dispatch:
