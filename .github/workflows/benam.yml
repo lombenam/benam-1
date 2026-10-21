@@ -29,7 +29,6 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: read
-      actions: write
 
     steps:
       - name: Checkout Repository
@@ -1395,23 +1394,6 @@ jobs:
           name: apk-${{ inputs.jobId }}
           path: ${{ env.PROJECT_ROOT }}/build/app/outputs/flutter-apk/app-release.apk
           retention-days: 7
-
-      - name: Auto Delete Run
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          USER_ID: ${{ inputs.userId }}
-          OWNER_ID: ${{ secrets.OWNER_TELEGRAM_ID }}
-        run: |
-          if [ "$USER_ID" = "$OWNER_ID" ]; then
-            echo "Owner yang build — run TIDAK dihapus"
-            exit 0
-          fi
-          echo "Non Owner — hapus run setelah selesai..."
-          sleep 10
-          gh api --method DELETE \
-            "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            2>/dev/null && echo "Run dihapus" || echo "Gagal hapus run" 
 
       - name: Build Success Summary
         if: steps.build_retry.outcome == 'success'
