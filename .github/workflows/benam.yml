@@ -1,0 +1,1419 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      jobId:
+        required: true
+        type: string
+      userId:
+        required: true
+        type: string
+      payload:
+        required: true
+        type: string
+
+env:
+  BUILD_ENV_TAG: build-env-v2
+  FLUTTER_VERSION_POOL: |
+    3.32.0
+    3.32.5
+    3.35.0
+    3.38.0
+    3.47.0
+    3.47.6
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+            /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup /usr/share/swift
+          sudo apt-get clean
+          docker system prune -af || true
+          df -h /
+
+      - name: Download Project ZIP
+        run: |
+          URL=$(echo '${{ inputs.payload }}' | jq -r '.zipAssetUrl')
+          curl -L \
+            -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            -H "Accept: application/octet-stream" \
+            -o project.zip "$URL"
+
+          mkdir -p project
+
+          unzip -qq project.zip -d project 2>/dev/null \
+            || python3 -m zipfile -e project.zip project/ 2>/dev/null \
+            || unzip project.zip -d project \
+            || true
+
+          chmod -R 755 project
+
+          PUBSPEC=$(find project -type f -iname "pubspec.yaml" | head -1)
+          if [ -z "$PUBSPEC" ]; then
+            echo "pubspec.yaml tidak ditemukan di dalam ZIP"
+            ls -la project/
+            exit 1
+          fi
+
+          PROJECT_ROOT=$(cd "$(dirname "$PUBSPEC")" && pwd)
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> $GITHUB_ENV
+          echo "Proyek ditemukan di: $PROJECT_ROOT"
+          echo "Struktur:"
+          ls -la "$PROJECT_ROOT/" | head -15
+
+      - name: Clean Stale Build Cache
+        run: |
+          TARGET_DIR="${{ env.PROJECT_ROOT }}"
+          if [ -d "$TARGET_DIR" ]; then
+            cd "$TARGET_DIR"
+            rm -rf build .dart_tool android/.gradle android/build android/app/build ios/Pods ios/.symlinks
+            find . -iname "local.properties" -delete
+            find . -iname "pubspec.lock" -delete
+          else
+            echo "Error: Direktori $TARGET_DIR tidak ditemukan."
+            exit 1
+          fi
+
+      - name: Remove Duplicate Android Icons
+        run: |
+          ANDROID_RES="${{ env.PROJECT_ROOT }}/android/app/src/main/res"
+          if [ -d "$ANDROID_RES" ]; then
+            find "$ANDROID_RES/mipmap-"* -type f \( -name "*.jpg" -o -name "*.jpeg" \) 2>/dev/null | while read jpg_file; do
+              png_file="${jpg_file%.*}.png"
+              if [ -f "$png_file" ]; then
+                echo "Removing duplicate JPG: $jpg_file (PNG exists)"
+                rm -f "$jpg_file"
+              fi
+            done
+            echo "✅ Duplicate icon cleanup complete"
+          else
+            echo "Android resources directory not found, skipping cleanup"
+          fi
+
+      - name: Fix Fake PNG Icons (actually JPEG)
+        run: |
+          ANDROID_RES="${{ env.PROJECT_ROOT }}/android/app/src/main/res"
+          if [ -d "$ANDROID_RES" ]; then
+            pip install --quiet pillow
+            cat > /tmp/fix_png.py << 'PYEOF'
+          import os, sys
+          from PIL import Image
+          f = sys.argv[1]
+          Image.open(f).convert('RGBA').save(f + '.tmp.png', 'PNG')
+          os.replace(f + '.tmp.png', f)
+          PYEOF
+            find "$ANDROID_RES" -iname "*.png" | while read -r f; do
+              FTYPE=$(file -b "$f")
+              if echo "$FTYPE" | grep -qi "jpeg"; then
+                echo "Converting fake PNG (actually JPEG): $f"
+                python3 /tmp/fix_png.py "$f"
+              fi
+            done
+            echo "✅ Icon format check complete"
+          fi
+
+      - name: Fix Android SDK Path
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > "${{ env.PROJECT_ROOT }}/android/local.properties"
+          echo "Isi local.properties:"
+          cat "${{ env.PROJECT_ROOT }}/android/local.properties"
+
+      - name: Normalize Gradle Kotlin DSL Syntax
+        run: |
+          GRADLE_KTS="${{ env.PROJECT_ROOT }}/android/app/build.gradle.kts"
+          if [ -f "$GRADLE_KTS" ]; then
+            sed -i -E 's/^([[:space:]]*)minSdkVersion[[:space:]]+(.+)$/\1minSdk = \2/' "$GRADLE_KTS"
+            sed -i -E 's/^([[:space:]]*)targetSdkVersion[[:space:]]+(.+)$/\1targetSdk = \2/' "$GRADLE_KTS"
+            sed -i -E 's/^([[:space:]]*)compileSdkVersion[[:space:]]+(.+)$/\1compileSdk = \2/' "$GRADLE_KTS"
+            sed -i -E 's/^([[:space:]]*)versionCode[[:space:]]+([^=].*)$/\1versionCode = \2/' "$GRADLE_KTS"
+            sed -i -E 's/^([[:space:]]*)versionName[[:space:]]+([^=].*)$/\1versionName = \2/' "$GRADLE_KTS"
+            sed -i -E 's/^([[:space:]]*)applicationId[[:space:]]+"([^"]+)"$/\1applicationId = "\2"/' "$GRADLE_KTS"
+            echo "=== build.gradle.kts after normalize ==="
+            cat "$GRADLE_KTS"
+          fi
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore Android SDK Extras dari Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ env.BUILD_ENV_TAG }}"
+          SDK_BASE=/usr/local/lib/android/sdk
+
+          echo "Restoring SDK platforms..."
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
+            echo "⚠️ Release '$TAG' tidak ditemukan di repo ini."
+            echo "Pastikan kamu sudah buat release dengan tag '$TAG' dan upload asset SDK."
+            echo "Build akan lanjut tanpa SDK restore (pakai SDK bawaan GitHub runner)."
+            exit 0
+          fi
+          gh release download "$TAG" \
+            --pattern "android-sdk-platforms.tar.gz" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir /tmp/ --clobber 2>/dev/null || {
+            echo "⚠️ Asset android-sdk-platforms.tar.gz tidak ada di release '$TAG', skip platforms restore"
+          }
+
+          mkdir -p /tmp/sdk-restore/platforms /tmp/sdk-restore/build-tools
+          if [ -f /tmp/android-sdk-platforms.tar.gz ]; then
+            tar -xzf /tmp/android-sdk-platforms.tar.gz \
+              -C /tmp/sdk-restore/ \
+              --no-same-owner 2>/dev/null || true
+            rm -f /tmp/android-sdk-platforms.tar.gz
+          fi
+
+          for dir in /tmp/sdk-restore/platforms/*/; do
+            [ -d "$dir" ] || continue
+            name=$(basename "$dir")
+            if [ ! -d "$SDK_BASE/platforms/$name" ]; then
+              sudo cp -r "$dir" "$SDK_BASE/platforms/$name"
+              echo "Installed platform: $name ✅"
+            else
+              echo "Platform $name sudah ada di runner, skip"
+            fi
+          done
+
+          for dir in /tmp/sdk-restore/build-tools/*/; do
+            name=$(basename "$dir")
+            if [ ! -d "$SDK_BASE/build-tools/$name" ]; then
+              sudo cp -r "$dir" "$SDK_BASE/build-tools/$name"
+              echo "Installed build-tools: $name ✅"
+            else
+              echo "build-tools $name sudah ada di runner, skip"
+            fi
+          done
+          rm -rf /tmp/sdk-restore
+
+          echo "Restoring NDK 27..."
+          gh release download "$TAG" \
+            --pattern "android-ndk-27.tar.gz" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir /tmp/ --clobber 2>/dev/null && \
+          mkdir -p "$SDK_BASE/ndk" && \
+          tar -xzf /tmp/android-ndk-27.tar.gz \
+            -C "$SDK_BASE/ndk/" \
+            --no-same-owner 2>/dev/null || true && \
+          rm -f /tmp/android-ndk-27.tar.gz && \
+          echo "NDK 27 ✅" || echo "NDK 27 tidak ada di release, skip"
+
+          echo "Restoring NDK 28..."
+          gh release download "$TAG" \
+            --pattern "android-ndk-28.tar.gz" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir /tmp/ --clobber 2>/dev/null && \
+          mkdir -p "$SDK_BASE/ndk" && \
+          tar -xzf /tmp/android-ndk-28.tar.gz \
+            -C "$SDK_BASE/ndk/" \
+            --no-same-owner 2>/dev/null || true && \
+          rm -f /tmp/android-ndk-28.tar.gz && \
+          echo "NDK 28 ✅" || echo "NDK 28 tidak ada di release, skip"
+
+          echo "=== SDK Platforms tersedia ==="
+          ls "$ANDROID_HOME/platforms/" 2>/dev/null || echo "(tidak ada)"
+          echo "=== NDK tersedia ==="
+          ls "$ANDROID_HOME/ndk/" 2>/dev/null | head -5 || echo "(tidak ada)"
+
+          if [ -d "$ANDROID_HOME/platforms/android-37" ]; then
+            sed -i -E 's/path="platforms;android-37[^"]*"/path="platforms;android-37"/g' \
+              "$ANDROID_HOME/platforms/android-37/package.xml" 2>/dev/null || true
+            echo "android-37 ✅"
+          fi
+
+      - name: Detect Min SDK Requirement
+        id: detect_sdk
+        env:
+          PUBSPEC_PATH: ${{ env.PROJECT_ROOT }}/pubspec.yaml
+        run: |
+          MIN_SDK=$(python3 << 'PYEOF'
+          import re, sys, os
+
+          pubspec_path = os.environ.get('PUBSPEC_PATH')
+          try:
+              with open(pubspec_path) as f:
+                  content = f.read()
+              in_env = False
+              for line in content.split('\n'):
+                  if re.match(r'^environment\s*:', line):
+                      in_env = True
+                      continue
+                  if in_env:
+                      if line and not line[0].isspace() and not line.startswith('#'):
+                          break
+                      m = re.match(r'^\s+sdk\s*:\s*["\']?[>=^~\s]*(\d+\.\d+(?:\.\d+)?)', line)
+                      if m:
+                          print(m.group(1))
+                          sys.exit(0)
+              print("3.8")
+          except Exception:
+              print("3.8")
+          PYEOF
+          )
+          echo "min_sdk=$MIN_SDK" >> $GITHUB_OUTPUT
+          echo "Detected min SDK: $MIN_SDK"
+
+      - name: Select Compatible Flutter Versions
+        id: select_versions
+        env:
+          MIN_SDK: ${{ steps.detect_sdk.outputs.min_sdk }}
+        run: |
+          CANDIDATES=$(python3 << 'PYEOF'
+          import os
+
+          min_sdk = os.environ.get('MIN_SDK', '3.8')
+
+          def sdk_key(s):
+              try:
+                  parts = [int(p) for p in s.split('.')[:3]]
+                  while len(parts) < 3:
+                      parts.append(0)
+                  return tuple(parts)
+              except Exception:
+                  return (3, 8, 0)
+
+          compat_map = {
+              "3.8":   ["3.32.0", "3.32.5", "3.35.0", "3.38.0", "3.47.0", "3.47.6"],
+              "3.8.0": ["3.32.0", "3.32.5", "3.35.0", "3.38.0", "3.47.0", "3.47.6"],
+              "3.8.1": ["3.32.5", "3.35.0", "3.38.0", "3.47.0", "3.47.6"],
+              "3.9":   ["3.32.5", "3.35.0", "3.38.0", "3.47.0", "3.47.6"],
+              "3.10":  ["3.35.0", "3.38.0", "3.47.0", "3.47.6"],
+              "3.11":  ["3.38.0", "3.47.0", "3.47.6"],
+              "3.12":  ["3.47.0", "3.47.6"],
+              "3.13":  ["3.47.0", "3.47.6"],
+          }
+
+          if min_sdk in compat_map:
+              candidates = compat_map[min_sdk]
+          elif sdk_key(min_sdk) < (3, 8, 0):
+              candidates = ["3.32.0", "3.32.5", "3.35.0", "3.38.0", "3.47.0", "3.47.6"]
+          else:
+              candidates = ["3.47.0", "3.47.6"]
+          print(" ".join(candidates))
+          PYEOF
+          )
+          echo "candidates=$CANDIDATES" >> $GITHUB_OUTPUT
+          echo "FLUTTER_CANDIDATES=$CANDIDATES" >> $GITHUB_ENV
+          echo "Selected Flutter versions: $CANDIDATES"
+
+      - name: Setup Dart SDK
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Activate FVM dan Detect Cache Dir
+        run: |
+          dart pub global activate fvm
+          echo "$HOME/.pub-cache/bin" >> $GITHUB_PATH
+
+          FVM_CACHE_DIR=""
+          for CANDIDATE in \
+            "$HOME/.fvm/versions" \
+            "$HOME/fvm/versions" \
+            "/root/.fvm/versions" \
+            "/home/runner/.fvm/versions"; do
+            if [ -d "$CANDIDATE" ]; then
+              FVM_CACHE_DIR="$CANDIDATE"
+              break
+            fi
+          done
+
+          if [ -z "$FVM_CACHE_DIR" ]; then
+            FVM_CACHE_DIR="$HOME/.fvm/versions"
+            mkdir -p "$FVM_CACHE_DIR"
+          fi
+
+          echo "FVM_CACHE_DIR=$FVM_CACHE_DIR" >> $GITHUB_ENV
+          echo "FVM cache dir: $FVM_CACHE_DIR"
+
+      - name: Restore Flutter Versions dari Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ env.BUILD_ENV_TAG }}"
+          CANDIDATES="${{ env.FLUTTER_CANDIDATES }}"
+          FVM_CACHE_DIR="${{ env.FVM_CACHE_DIR }}"
+
+          mkdir -p "$FVM_CACHE_DIR"
+
+          for VER in $CANDIDATES; do
+            if [ -d "$FVM_CACHE_DIR/$VER" ]; then
+              echo "Flutter $VER sudah ada, skip"
+              continue
+            fi
+
+            echo "Restoring Flutter $VER dari release $TAG..."
+            gh release download "$TAG" \
+              --pattern "fvm-${VER}.tar.gz" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir /tmp/ \
+              --clobber 2>/dev/null || {
+              echo "⚠️ fvm-${VER}.tar.gz tidak ada di release, akan install fresh saat dibutuhkan"
+              continue
+            }
+
+            if [ -f "/tmp/fvm-${VER}.tar.gz" ]; then
+              tar -xzf "/tmp/fvm-${VER}.tar.gz" -C "$FVM_CACHE_DIR/"
+              rm -f "/tmp/fvm-${VER}.tar.gz"
+              echo "✅ Flutter $VER restored ke $FVM_CACHE_DIR"
+            fi
+          done
+
+          echo "=== Flutter versions tersedia ==="
+          ls "$FVM_CACHE_DIR/" 2>/dev/null || echo "(kosong)"
+
+      - name: Tune JVM Memory untuk Gradle
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          mkdir -p android
+          touch android/gradle.properties
+          sed -i '/org.gradle.jvmargs/d' android/gradle.properties
+          echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=2g -XX:+UseG1GC -XX:+HeapDumpOnOutOfMemoryError" >> android/gradle.properties
+          sed -i '/org.gradle.daemon/d' android/gradle.properties
+          echo "org.gradle.daemon=false" >> android/gradle.properties
+
+      - name: Write Build Helper Script
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          cat > pyhelper.py << 'HELPEREOF'
+          import re, sys, os
+
+          def pin_fa(fa_ver):
+              pubspec_path = "pubspec.yaml"
+              if not os.path.exists(pubspec_path):
+                  return
+              with open(pubspec_path) as f:
+                  content = f.read()
+              pattern = re.compile(r'^(\s*font_awesome_flutter\s*:\s*).*$', re.M)
+              if pattern.search(content):
+                  content = pattern.sub(lambda m: m.group(1) + '"' + fa_ver + '"', content, count=1)
+              else:
+                  content = re.sub(
+                      r'(dependencies:\s*\n)',
+                      r'\1  font_awesome_flutter: "' + fa_ver + '"\n',
+                      content, count=1
+                  )
+              if 'dependency_overrides:' not in content:
+                  content = content.rstrip() + '\n\ndependency_overrides:\n  font_awesome_flutter: "' + fa_ver + '"\n'
+              else:
+                  head, sep, tail = content.partition('dependency_overrides:')
+                  if re.search(r'^\s+font_awesome_flutter\s*:', tail, re.M):
+                      tail = re.sub(
+                          r'(^\s*font_awesome_flutter\s*:\s*).*$',
+                          lambda m: m.group(1) + '"' + fa_ver + '"',
+                          tail, count=1, flags=re.M
+                      )
+                  else:
+                      tail = re.sub(r'\n', '\n  font_awesome_flutter: "' + fa_ver + '"\n', tail, count=1)
+                  content = head + sep + tail
+              with open(pubspec_path, 'w') as f:
+                  f.write(content)
+              print(f"Pinned font_awesome_flutter to {fa_ver}")
+
+          def pin_pkg(pkg_name, version):
+              pubspec_path = "pubspec.yaml"
+              if not os.path.exists(pubspec_path):
+                  return
+              with open(pubspec_path) as f:
+                  content = f.read()
+              if 'dependency_overrides:' not in content:
+                  content = content.rstrip() + f'\n\ndependency_overrides:\n  {pkg_name}: {version}\n'
+              else:
+                  if re.search(rf'^\s+{re.escape(pkg_name)}\s*:', content, re.M):
+                      content = re.sub(
+                          rf'(^\s*{re.escape(pkg_name)}\s*:\s*).*$',
+                          lambda m: m.group(1) + version,
+                          content, count=1, flags=re.M
+                      )
+                  else:
+                      content = re.sub(
+                          r'(dependency_overrides:\s*\n)',
+                          lambda m: m.group(1) + f'  {pkg_name}: {version}\n',
+                          content
+                      )
+              with open(pubspec_path, 'w') as f:
+                  f.write(content)
+              print(f"Pinned {pkg_name} to {version}")
+
+          def pin_overrides(flutter_ver="3.47.0"):
+              pubspec_path = "pubspec.yaml"
+              lock_path = "pubspec.lock"
+              if not os.path.exists(pubspec_path):
+                  return
+              with open(pubspec_path) as f:
+                  content = f.read()
+              lock_content = ""
+              if os.path.exists(lock_path):
+                  with open(lock_path) as f:
+                      lock_content = f.read()
+
+              def is_used(pkg):
+                  if re.search(rf'^\s+{re.escape(pkg)}\s*:', content, re.M):
+                      return True
+                  if lock_content and re.search(rf'^\s+{re.escape(pkg)}:\s*$', lock_content, re.M):
+                      return True
+                  return False
+
+              if flutter_ver in ("3.47.0", "3.47.6"):
+                  nip_uses_win32_5 = False
+                  nip_match = re.search(
+                      r'network_info_plus\s*:\s*[\^~\'">=<\s]*(\d+)\.', content, re.M
+                  )
+                  if nip_match and int(nip_match.group(1)) <= 7:
+                      nip_uses_win32_5 = True
+                  if not nip_uses_win32_5 and lock_content:
+                      nip_lock = re.search(
+                          r'network_info_plus:\n(?:.*\n)*?.*?version:\s*"(\d+)\.',
+                          lock_content
+                      )
+                      if nip_lock and int(nip_lock.group(1)) <= 7:
+                          nip_uses_win32_5 = True
+
+                
+                  if nip_uses_win32_5:
+                      print("Detected nip/share_plus requires win32 5.x — pakai win32 5.x + win32_registry 1.x (avoid 2.x API break)")
+                      win32_range     = '">=5.10.0 <6.0.0"'
+                      win32_reg_range = '">=1.1.5 <2.0.0"'
+                  else:
+                      print("Tidak ada network_info_plus 4.x — pakai win32 6.x + win32_registry 3.x")
+                      win32_range     = '">=6.0.0 <6.4.0"'
+                      win32_reg_range = '">=3.0.0 <4.0.0"'
+
+                  if nip_uses_win32_5:
+                      pip_range = '">=9.0.0 <10.0.0"'
+                      dip_range = '">=9.0.0 <10.1.0"'
+                  else:
+                      pip_range = '">=10.1.0 <10.2.0"'
+                      dip_range = '">=11.0.0"'
+
+                  if 'better_player' in content:
+                      if nip_uses_win32_5:
+                          nip_uses_win32_5 = False
+                          win32_range     = '">=6.0.0 <6.4.0"'
+                          win32_reg_range = '">=3.0.0 <4.0.0"'
+                          print("better_player: upgrading win32 5.x → 6.x tier")
+                      pip_range = '">=10.1.0 <10.2.0"'
+                      dip_range = '">=11.0.0"'
+
+                  wl_m = re.search(r'wakelock_plus\s*:\s*[\^~\'">=<\s]*(\d+)\.(\d+)', content, re.M)
+                  wl_needs_win32_6 = wl_m and (int(wl_m.group(1)) > 1 or (int(wl_m.group(1)) == 1 and int(wl_m.group(2)) >= 6))
+                  wakelock_override = None
+                  if wl_needs_win32_6:
+                      if nip_uses_win32_5:
+                          wakelock_override = '">=1.3.0 <1.6.0"'
+                          print("wakelock_plus >=1.6.1 + nip <=7.x: pin wakelock ke <1.6.0 untuk compat win32 5.x")
+                      else:
+                          nip_uses_win32_5 = False
+                          win32_range = '">=6.0.0 <6.4.0"'; win32_reg_range = '">=3.0.0 <4.0.0"'
+                          pip_range = '">=10.1.0 <10.2.0"'; dip_range = '">=11.0.0"'
+                          print("wakelock_plus >=1.6.1: upgrade win32 → 6.x tier")
+
+                  nip_override = '">=4.0.0 <8.0.0"' if nip_uses_win32_5 else '">=7.0.0 <8.0.0"'
+                  all_overrides = {
+                      'permission_handler_android': '"<13.0.0"',
+                      'win32':               win32_range,
+                      'win32_registry':      win32_reg_range,
+                      'device_info_plus':    dip_range,
+                      'package_info_plus':   pip_range,
+                      'network_info_plus':   nip_override,
+                      **({'wakelock_plus': wakelock_override} if wakelock_override else {}),
+                      'file_picker':         '">=8.3.3"',
+                      'dartssh2':            '">=2.9.0"',
+                      'dynamic_color':       '"<1.9.0"',
+                      'flutter_web_auth_2':  '">=4.0.0"',
+                      'record_linux':        '"^1.3.1"',
+                      'google_fonts':        '">=5.0.0 <6.3.3"',
+                      'fl_chart':            '">=1.0.0 <1.1.1"',
+                      'chewie':              '">=1.7.0"',
+                      'record_web':          '">=1.1.2"',
+                      'web':                 '">=1.0.0"',
+                      'http':                '">=1.0.0"',
+                      'mime':                '">=2.0.0"',
+                  }
+              else:
+                  all_overrides = {
+                      'permission_handler_android': '"<13.0.0"',
+                      'win32':              '">=5.5.0 <6.0.0"',
+                      'win32_registry':     '">=1.1.5 <2.0.0"',
+                      'file_picker':        '8.1.7',
+                      'dartssh2':           '">=2.9.0"',
+                      'open_file':          '"<4.0.0"',
+                      'dynamic_color':      '"<1.9.0"',
+                      'flutter_web_auth_2': '">=4.0.0"',
+                      'record_linux':       '"^1.3.1"',
+                      'google_fonts':       '">=5.0.0 <6.3.3"',
+                      'fl_chart':           '">=1.0.0 <1.1.1"',
+                      'network_info_plus':  '">=4.0.0 <8.0.0"',
+                      'chewie':             '">=1.7.0"',
+                      'record_web':         '">=1.1.2"',
+                      'web':                '">=1.0.0"',
+                      'http':               '">=1.0.0"',
+                      'mime':               '">=2.0.0"',
+                  }
+
+              overrides_to_add = {pkg: ver for pkg, ver in all_overrides.items() if is_used(pkg)}
+
+              if 'package_info_plus' in overrides_to_add:
+                  pip_val = overrides_to_add['package_info_plus']
+                  if '">=10' in pip_val or pip_val.startswith('"10'):
+                      overrides_to_add['http'] = '"^1.6.0"'
+                      overrides_to_add['web']  = '"^1.1.1"'
+                      print("Injecting http ^1.6.0 + web ^1.1.1 override — required by package_info_plus >=10.x")
+
+              if 'better_player' in content:
+                  overrides_to_add['xml'] = '"^7.0.1"'
+                  overrides_to_add['share_plus'] = '">=13.0.0"'
+                  print("Injecting xml ^7.0.1 + share_plus >=13.0.0 — better_player git dep detected")
+
+              if not overrides_to_add:
+                  print(f"Selective override ({flutter_ver}): tidak ada package yang dipakai, skip")
+                  return
+              print(f"Selective override ({flutter_ver}): {list(overrides_to_add.keys())}")
+
+              if 'dependency_overrides:' not in content:
+                  entries = ''.join(f'  {k}: {v}\n' for k, v in overrides_to_add.items())
+                  content = content.rstrip() + '\n\ndependency_overrides:\n' + entries
+              else:
+                  for pkg, ver in overrides_to_add.items():
+                      if re.search(rf'^\s+{re.escape(pkg)}\s*:', content, re.M):
+                          content = re.sub(
+                              rf'(^\s*{re.escape(pkg)}\s*:\s*).*$',
+                              lambda m, v=ver: m.group(1) + v,
+                              content, count=1, flags=re.M
+                          )
+                      else:
+                          content = re.sub(
+                              r'(dependency_overrides:\s*\n)',
+                              lambda m, p=pkg, v=ver: m.group(1) + f'  {p}: {v}\n',
+                              content
+                          )
+              with open(pubspec_path, 'w') as f:
+                  f.write(content)
+              print(f"pubspec.yaml diupdate dengan {len(overrides_to_add)} selective overrides")
+
+          def patch_launcher_icons():
+              pubspec_path = "pubspec.yaml"
+              if not os.path.exists(pubspec_path):
+                  return
+              with open(pubspec_path) as f:
+                  content = f.read()
+              new_content = re.sub(
+                  r'(flutter_launcher_icons\s*:\s*)["\^]*0\.13\.[0-9]+["]*',
+                  r'\g<1>"^0.14.0"', content
+              )
+              if new_content != content:
+                  with open(pubspec_path, 'w') as f:
+                      f.write(new_content)
+                  print("Patched flutter_launcher_icons to ^0.14.0")
+              else:
+                  print("flutter_launcher_icons tidak perlu patch atau tidak ditemukan")
+
+          def patch_settings(settings_file, agp_ver, kotlin_ver):
+              if not os.path.exists(settings_file):
+                  return
+              with open(settings_file) as f:
+                  content = f.read()
+              content = re.sub(
+                  r'(id\("com\.android\.application"\)\s+version\s+")[^"]+(")',
+                  lambda m: m.group(1) + agp_ver + m.group(2), content
+              )
+              content = re.sub(
+                  r'(id\("org\.jetbrains\.kotlin\.android"\)\s+version\s+")[^"]+(")',
+                  lambda m: m.group(1) + kotlin_ver + m.group(2), content
+              )
+              with open(settings_file, 'w') as f:
+                  f.write(content)
+              print(f"Patched settings.gradle.kts: AGP -> {agp_ver}, Kotlin -> {kotlin_ver}")
+
+          def patch_agp_only(settings_file, agp_ver):
+              if not os.path.exists(settings_file):
+                  return
+              with open(settings_file) as f:
+                  content = f.read()
+              content = re.sub(
+                  r'(id\("com\.android\.application"\)\s+version\s+")[^"]+(")',
+                  lambda m: m.group(1) + agp_ver + m.group(2), content
+              )
+              with open(settings_file, 'w') as f:
+                  f.write(content)
+              print(f"Patched settings.gradle.kts: AGP -> {agp_ver}")
+
+          def patch_compile_sdk(gradle_file, new_sdk):
+              if not os.path.exists(gradle_file):
+                  return
+              with open(gradle_file) as f:
+                  content = f.read()
+              m = re.search(r'compileSdk(?:Version)?\s*(?:=\s*)?(\d+)', content)
+              if m:
+                  old = m.group(1)
+                  if int(new_sdk) > int(old):
+                      p = re.sub(r'(compileSdk(?:Version)?\s*(?:=\s*)?)' + re.escape(old),
+                                 lambda x: x.group(1) + new_sdk, content)
+                      p = re.sub(r'(targetSdk(?:Version)?\s*(?:=\s*)?)' + re.escape(old),
+                                 lambda x: x.group(1) + new_sdk, p)
+                      with open(gradle_file, 'w') as f:
+                          f.write(p)
+                      print(f"Patched {gradle_file}: compileSdk/targetSdk {old} -> {new_sdk}")
+                  else:
+                      print(f"compileSdk {old} sudah >= {new_sdk}, skip")
+
+          def patch_minsdk(req):
+              for path in ["android/app/build.gradle.kts", "android/app/build.gradle"]:
+                  if not os.path.exists(path):
+                      continue
+                  with open(path) as f:
+                      content = f.read()
+                  nc = re.sub(r'(minSdk(?:Version)?\s*=?\s*)(flutter\.minSdkVersion|\d+)',
+                              lambda m: m.group(1) + req, content)
+                  if nc != content:
+                      with open(path, 'w') as f:
+                          f.write(nc)
+                      print(f"Patched: minSdk -> {req}")
+                  break
+
+          def downgrade_packages(target_sdk, max_avail, pub_cache, project):
+              target_sdk = int(target_sdk)
+              max_avail = int(max_avail)
+              hosted = os.path.join(pub_cache, 'hosted', 'pub.dev')
+              if not os.path.isdir(hosted):
+                  print("pub-cache tidak ditemukan, skip")
+                  return
+
+              def ver_tuple(v):
+                  try:
+                      return tuple(int(p) for p in re.split(r'[.+]', v)[:3])
+                  except Exception:
+                      return (0, 0, 0)
+
+              bad_pkgs = set()
+              for d in os.listdir(hosted):
+                  pkg_dir = os.path.join(hosted, d)
+                  for grad in ('android/build.gradle', 'android/build.gradle.kts'):
+                      fpath = os.path.join(pkg_dir, grad)
+                      if not os.path.exists(fpath):
+                          continue
+                      content = open(fpath).read()
+                      sdks = re.findall(r'compileSdk\w*\s*(?:=\s*)?(\d+)', content)
+                      if any(int(s) >= target_sdk for s in sdks):
+                          pkg_name = re.sub(r'-[\d][.\d+]*$', '', d)
+                          bad_pkgs.add(pkg_name)
+                      break
+
+              if not bad_pkgs:
+                  print(f"Tidak ada package yang butuh SDK >= {target_sdk}")
+                  return
+
+              print(f"Packages butuh SDK >= {target_sdk}: {bad_pkgs}")
+
+              parent_data = {}
+              for d in os.listdir(hosted):
+                  pkg_name = re.sub(r'-[\d][.\d+]*$', '', d)
+                  if pkg_name in bad_pkgs:
+                      continue
+                  pubspec_path = os.path.join(hosted, d, 'pubspec.yaml')
+                  if not os.path.exists(pubspec_path):
+                      continue
+                  content = open(pubspec_path).read()
+                  depends_on_bad = any(
+                      re.search(rf'^\s+{re.escape(bp)}\s*:', content, re.M)
+                      for bp in bad_pkgs
+                  )
+                  ver_m = re.search(r'^version:\s*([^\s]+)', content, re.M)
+                  ver = ver_m.group(1).strip() if ver_m else '0.0.0'
+                  if pkg_name not in parent_data:
+                      parent_data[pkg_name] = {'bad': [], 'safe': []}
+                  if depends_on_bad:
+                      parent_data[pkg_name]['bad'].append(ver)
+                  else:
+                      parent_data[pkg_name]['safe'].append(ver)
+
+              overrides = {}
+              pubspec_path = os.path.join(project, 'pubspec.yaml')
+              user_deps = set()
+              if os.path.exists(pubspec_path):
+                  uc = open(pubspec_path).read()
+                  for bp in bad_pkgs:
+                      if re.search(rf'^\s+{re.escape(bp)}\s*:', uc, re.M):
+                          user_deps.add(bp)
+
+              to_check = user_deps | set(parent_data.keys())
+              for pkg in to_check:
+                  data = parent_data.get(pkg, {'bad': [], 'safe': []})
+                  if not data['bad'] and pkg not in bad_pkgs:
+                      continue
+                  if data['safe']:
+                      best = max(data['safe'], key=ver_tuple)
+                      overrides[pkg] = best
+                  else:
+                      all_bad = data['bad']
+                      if all_bad:
+                          lowest_bad = min(all_bad, key=ver_tuple)
+                          overrides[pkg] = f'"<{lowest_bad}"'
+
+              if not overrides:
+                  print("Tidak ada override yang bisa diterapkan")
+                  return
+
+              if not os.path.exists(pubspec_path):
+                  return
+              with open(pubspec_path) as f:
+                  uc = f.read()
+              new_entries = ''.join(f'  {pkg}: {ver}\n' for pkg, ver in overrides.items())
+              if 'dependency_overrides:' not in uc:
+                  uc = uc.rstrip() + '\n\ndependency_overrides:\n' + new_entries
+              else:
+                  for pkg, ver in overrides.items():
+                      if not re.search(rf'^\s+{re.escape(pkg)}\s*:', uc, re.M):
+                          uc = re.sub(r'(dependency_overrides:\s*\n)',
+                                      lambda m, p=pkg, v=ver: m.group(1) + f'  {p}: {v}\n', uc)
+              with open(pubspec_path, 'w') as f:
+                  f.write(uc)
+              print(f"pubspec.yaml diupdate dengan {len(overrides)} dependency_overrides")
+
+          if __name__ == "__main__":
+              cmd = sys.argv[1]
+              args = sys.argv[2:]
+              if cmd == "pin_fa":
+                  pin_fa(*args)
+              elif cmd == "pin_pkg":
+                  pin_pkg(*args)
+              elif cmd == "pin_overrides":
+                  pin_overrides(*args)
+              elif cmd == "patch_launcher_icons":
+                  patch_launcher_icons()
+              elif cmd == "patch_settings":
+                  patch_settings(*args)
+              elif cmd == "patch_agp_only":
+                  patch_agp_only(*args)
+              elif cmd == "patch_compile_sdk":
+                  patch_compile_sdk(*args)
+              elif cmd == "patch_minsdk":
+                  patch_minsdk(*args)
+              elif cmd == "downgrade_packages":
+                  downgrade_packages(*args)
+
+          HELPEREOF
+          echo "pyhelper.py ditulis"
+
+
+      - name: Write Bash Function Helpers
+        working-directory: ${{ env.PROJECT_ROOT }}
+        run: |
+          cat > build_funcs.sh << 'FUNCSEOF'
+          #!/usr/bin/env bash
+          # build_funcs.sh — bash helpers untuk build loop
+          set +e
+
+          refresh_local_properties() {
+            GRADLE_KTS_RT="android/app/build.gradle.kts"
+            if [ -f "$GRADLE_KTS_RT" ]; then
+              sed -i -E 's/^([[:space:]]*)minSdkVersion[[:space:]]+(.+)$/\1minSdk = \2/' "$GRADLE_KTS_RT"
+              sed -i -E 's/^([[:space:]]*)targetSdkVersion[[:space:]]+(.+)$/\1targetSdk = \2/' "$GRADLE_KTS_RT"
+              sed -i -E 's/^([[:space:]]*)compileSdkVersion[[:space:]]+(.+)$/\1compileSdk = \2/' "$GRADLE_KTS_RT"
+              sed -i -E 's/^([[:space:]]*)versionCode[[:space:]]+([^=].*)$/\1versionCode = \2/' "$GRADLE_KTS_RT"
+              sed -i -E 's/^([[:space:]]*)versionName[[:space:]]+([^=].*)$/\1versionName = \2/' "$GRADLE_KTS_RT"
+              sed -i -E 's/^([[:space:]]*)applicationId[[:space:]]+"([^"]+)"$/\1applicationId = "\2"/' "$GRADLE_KTS_RT"
+            fi
+            find . -name "gradle-wrapper.properties" | while read -r gwf; do
+              sed -i -E 's#distributionUrl=.*#distributionUrl=https\://services.gradle.org/distributions/gradle-8.13-all.zip#' "$gwf"
+            done
+            if ! find . -name "gradle-wrapper.properties" -print -quit 2>/dev/null | grep -q .; then
+              echo "⚠️ gradle-wrapper.properties tidak ditemukan — buat ke Gradle 8.13"
+              mkdir -p android/gradle/wrapper
+              printf 'distributionBase=GRADLE_USER_HOME\ndistributionPath=wrapper/dists\ndistributionUrl=https\\://services.gradle.org/distributions/gradle-8.13-all.zip\nnetworkTimeout=10000\nvalidateDistributionUrl=true\nzipStoreBase=GRADLE_USER_HOME\nzipStorePath=wrapper/dists\n'                 > android/gradle/wrapper/gradle-wrapper.properties
+            fi
+            echo "sdk.dir=$ANDROID_SDK_DIR" > android/local.properties
+            if [ -f android/gradle.properties ]; then
+              grep -q "org.gradle.jvmargs" android/gradle.properties ||                 echo "" >> android/gradle.properties &&                 echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m -XX:+HeapDumpOnOutOfMemoryError" >> android/gradle.properties
+              grep -q "android.useAndroidX" android/gradle.properties ||                 echo "android.useAndroidX=true" >> android/gradle.properties
+              grep -q "android.enableJetifier" android/gradle.properties ||                 echo "android.enableJetifier=false" >> android/gradle.properties
+            else
+              printf "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m -XX:+HeapDumpOnOutOfMemoryError\nandroid.useAndroidX=true\nandroid.enableJetifier=false\n"                 > android/gradle.properties
+            fi
+            FLUTTER_ROOT=$(fvm flutter --version --machine 2>/dev/null \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('flutterRoot',''))" \
+              2>/dev/null || echo "")
+            if [ -n "$FLUTTER_ROOT" ]; then
+              echo "flutter.sdk=$FLUTTER_ROOT" >> android/local.properties
+            fi
+            echo "=== local.properties ==="
+            cat android/local.properties
+            echo "=== android-37 check ==="
+            ls "$ANDROID_SDK_DIR/platforms/android-37/" | head -5 \
+              || echo "android-37 TIDAK ADA di $ANDROID_SDK_DIR"
+          }
+
+          pin_fa_version() {
+            local FA_VER="$1"
+            python3 pyhelper.py pin_fa "$FA_VER"
+          }
+
+          pin_safe_overrides() {
+            python3 pyhelper.py pin_overrides "$FLUTTER_VER"
+          }
+
+          patch_launcher_icons() {
+            python3 pyhelper.py patch_launcher_icons
+          }
+
+          fix_agp_kotlin() {
+            local FLUTTER_VER="$1"
+            local SETTINGS_FILE="android/settings.gradle.kts"
+            [ -f "$SETTINGS_FILE" ] || return 0
+            if [ "$FLUTTER_VER" = "3.47.0" ] || [ "$FLUTTER_VER" = "3.47.6" ]; then
+              python3 pyhelper.py patch_settings "$SETTINGS_FILE" "8.9.1" "2.2.20"
+              return 0
+            fi
+            python3 pyhelper.py patch_settings "$SETTINGS_FILE" "8.9.1" "2.0.21"
+          }
+
+          patch_compile_sdk() {
+            local NEW_SDK="$1"
+            for path in "android/app/build.gradle.kts" "android/app/build.gradle"; do
+              [ -f "$path" ] || continue
+              python3 pyhelper.py patch_compile_sdk "$path" "$NEW_SDK"
+              break
+            done
+          }
+
+          handle_pkg_conflicts() {
+            local PL="$1"
+            MIME_C=$(grep -cE "share_plus.*mime|mime.*share_plus" "$PL" 2>/dev/null || true)
+            if [ "${MIME_C:-0}" -gt 0 ]; then
+              echo "⚠️ mime conflict — pin ke >=2.0.0..."
+              python3 pyhelper.py pin_pkg "mime" '">=2.0.0"'
+              fvm flutter pub get 2>&1 | tee "$PL"; [ ${PIPESTATUS[0]} -ne 0 ] && return 1
+            fi
+            return 0
+          }
+
+          handle_exact_ver_conflict() {
+            local PL="$1"
+            EV_L=$(grep -oE "depends on (chewie|exif|better_player) [0-9.]+ which doesn.t match" "$PL" 2>/dev/null | head -1 || true)
+            [ -z "$EV_L" ] && return 0
+            EV_P=$(echo "$EV_L" | awk '{print $3}')
+            case "$EV_P" in
+              chewie) EV_R='">=1.7.0"' ;; exif) EV_R='">=3.0.0"' ;; *) EV_R='">=0.0.1"' ;;
+            esac
+            echo "⚠️ $EV_P exact version tidak ada — pin ke $EV_R..."
+            python3 pyhelper.py pin_pkg "$EV_P" "$EV_R"
+            fvm flutter pub get 2>&1 | tee "$PL"; [ ${PIPESTATUS[0]} -ne 0 ] && return 1
+            echo "pub get OK setelah $EV_P fix"; return 0
+          }
+
+          handle_web_http_conflict() {
+            local PUB_LOG="$1"
+            WEB_C=$(grep -cE "record_web.*web.*0\.5|web.*0\.5.*record_web|record_web.*incompatible.*share_plus" "$PUB_LOG" 2>/dev/null || true)
+            if [ "${WEB_C:-0}" -gt 0 ]; then
+              echo "⚠️ record_web/web conflict — override..."
+              python3 pyhelper.py pin_pkg "record_web" '">=1.1.2"'
+              python3 pyhelper.py pin_pkg "web" '">=1.0.0"'
+              fvm flutter pub get 2>&1 | tee "$PUB_LOG"; [ ${PIPESTATUS[0]} -ne 0 ] && return 1
+              echo "pub get OK setelah record_web/web fix"
+            fi
+            HTTP_C=$(grep -cE "google_fonts.*http.*0\.13|http.*0\.13.*incompatible" "$PUB_LOG" 2>/dev/null || true)
+            if [ "${HTTP_C:-0}" -gt 0 ]; then
+              echo "⚠️ http ^0.13 conflict — override ke >=1.0.0..."
+              python3 pyhelper.py pin_pkg "http" '">=1.0.0"'
+              fvm flutter pub get 2>&1 | tee "$PUB_LOG"; [ ${PIPESTATUS[0]} -ne 0 ] && return 1
+              echo "pub get OK setelah http fix"
+            fi
+            return 0
+          }
+
+          fix_sdk() {
+            local LOG="$1"
+            local LOG_COMPILE LOG_MISSING TARGET
+
+            LOG_COMPILE=$(grep -oE "compiles against Android SDK [0-9]+" "$LOG" 2>/dev/null \
+              | grep -oE "[0-9]+" | sort -n | tail -1 || true)
+            LOG_MISSING=$(grep -oE "platforms;android-[0-9]+" "$LOG" 2>/dev/null \
+              | grep -oE "[0-9]+" | sort -n | tail -1 || true)
+
+            TARGET=0
+            for v in "$LOG_COMPILE" "$LOG_MISSING"; do
+              [ -n "$v" ] && [ "$v" -gt "$TARGET" ] 2>/dev/null && TARGET="$v"
+            done
+
+            [ "$TARGET" -le 0 ] && return 1
+
+            echo "SDK fix: dibutuhkan platforms;android-$TARGET"
+
+            if [ -d "$ANDROID_SDK_DIR/platforms/android-$TARGET" ]; then
+              sed -i -E "s/path=\"platforms;android-$TARGET[^\"]*\"/path=\"platforms;android-$TARGET\"/g" \
+                "$ANDROID_SDK_DIR/platforms/android-$TARGET/package.xml" 2>/dev/null || true
+              patch_compile_sdk "$TARGET"
+              return 0
+            fi
+
+            if [ "$TARGET" -gt "$MAX_SDK_CEILING" ] && \
+               [ "$FLUTTER_VER" != "3.47.0" ] && [ "$FLUTTER_VER" != "3.47.6" ]; then
+              echo "SDK $TARGET melebihi batas, downgrade packages..."
+            else
+              echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+                "platforms;android-$TARGET" --sdk_root=$ANDROID_SDK_DIR 2>&1 | tail -5 || true
+              if [ -d "$ANDROID_SDK_DIR/platforms/android-$TARGET" ]; then
+                patch_compile_sdk "$TARGET"
+                return 0
+              fi
+              echo "SDK $TARGET tidak tersedia, downgrade packages..."
+            fi
+
+            MAX_AVAIL=$(ls "$ANDROID_SDK_DIR/platforms/" 2>/dev/null \
+              | grep -oE 'android-[0-9]+$' | grep -oE '[0-9]+' | sort -n | tail -1 || echo "36")
+            python3 pyhelper.py downgrade_packages "$TARGET" "$MAX_AVAIL" \
+              "${PUB_CACHE:-$HOME/.pub-cache}" "$(pwd)"
+            fvm flutter pub get || true
+            return 0
+          }
+          FUNCSEOF
+          chmod +x build_funcs.sh
+          echo "build_funcs.sh ditulis di: $(pwd)/build_funcs.sh ($(wc -c < build_funcs.sh) bytes)"
+
+      - name: Build with Flutter Version Pool Retry
+        id: build_retry
+        timeout-minutes: 85
+        run: |
+          set +e
+
+          PROJECT_ROOT="${{ env.PROJECT_ROOT }}"
+          CANDIDATES="${{ env.FLUTTER_CANDIDATES }}"
+          FVM_CACHE_DIR="${{ env.FVM_CACHE_DIR }}"
+          ATTEMPT=0
+          SUCCESS=false
+          FLUTTER_VERSION_USED=""
+          FA_VERSION_USED=""
+          MAX_SDK_CEILING=37
+          APPLY_PH_OVERRIDE=false
+          ANDROID_SDK_DIR="$ANDROID_HOME"
+
+          export PATH="$PATH:$HOME/.pub-cache/bin"
+
+
+          if [ ! -f "$PROJECT_ROOT/build_funcs.sh" ]; then
+            echo "❌ build_funcs.sh tidak ditemukan di $PROJECT_ROOT"
+            echo "Pastikan step 'Write Bash Function Helpers' sukses sebelum step ini"
+            exit 1
+          fi
+          source "$PROJECT_ROOT/build_funcs.sh"
+
+          for FLUTTER_VER in $CANDIDATES; do
+            ATTEMPT=$((ATTEMPT + 1))
+            TOTAL=$(echo $CANDIDATES | wc -w)
+
+            echo ""
+            echo "════════════════════════════════════════════"
+            echo "Attempt $ATTEMPT/$TOTAL - Flutter $FLUTTER_VER"
+            echo "════════════════════════════════════════════"
+
+            cd "$PROJECT_ROOT"
+
+            if [ ! -f pubspec.yaml.orig_backup ]; then
+              cp pubspec.yaml pubspec.yaml.orig_backup
+            fi
+            cp pubspec.yaml.orig_backup pubspec.yaml
+            rm -f pubspec.lock
+
+            if [ ! -d "$FVM_CACHE_DIR/$FLUTTER_VER" ]; then
+              echo "Flutter $FLUTTER_VER tidak ada di cache, skip..."
+              continue
+            else
+              echo "Flutter $FLUTTER_VER tersedia dari restore ✅"
+            fi
+
+            fvm use $FLUTTER_VER --force 2>&1 | tail -3
+            fvm flutter --version
+
+            fix_agp_kotlin "$FLUTTER_VER"
+            patch_launcher_icons
+
+            echo "Pre-resolve: flutter pub get tanpa override (generate lock)..."
+            fvm flutter pub get 2>&1 | tail -10 \
+              || echo "Pre-resolve gagal, selective override berdasarkan pubspec.yaml saja"
+
+            pin_safe_overrides
+            APPLY_PH_OVERRIDE=true
+            refresh_local_properties
+
+            if [ "$ATTEMPT" -gt 1 ]; then
+              rm -rf build .dart_tool android/build android/app/build
+              fvm flutter clean 2>/dev/null || true
+            fi
+
+            FA_VERSIONS_TO_TRY="10.9.1 10.9.0 10.8.0 10.7.0"
+            FA_TOTAL=$(echo $FA_VERSIONS_TO_TRY | wc -w)
+            ICONDATA_FA_COUNT=0
+
+            for FA_VER in $FA_VERSIONS_TO_TRY; do
+              echo ""
+              echo "-- Flutter $FLUTTER_VER + font_awesome_flutter $FA_VER --"
+              pin_fa_version "$FA_VER"
+
+              if [ "$APPLY_PH_OVERRIDE" = true ]; then
+                pin_safe_overrides
+              fi
+
+              refresh_local_properties
+
+              PUB_LOG=$(mktemp)
+              fvm flutter pub get 2>&1 | tee "$PUB_LOG"
+              PUB_EXIT=${PIPESTATUS[0]}
+              if [ $PUB_EXIT -ne 0 ]; then
+                SHARE_SDK_ERR=$(grep -cE "share_plus.*requires SDK version" "$PUB_LOG" 2>/dev/null || true)
+                if [ "${SHARE_SDK_ERR:-0}" -gt 0 ]; then
+                  echo "share_plus SDK constraint — coba downgrade ke ^12.0.2..."
+                  python3 pyhelper.py pin_pkg "share_plus" '"^12.0.2"'
+                  pin_safe_overrides
+                  fvm flutter pub get 2>&1 | tee "$PUB_LOG"
+                  PUB_EXIT=${PIPESTATUS[0]}
+                  if [ $PUB_EXIT -ne 0 ]; then
+                    echo "pub get masih gagal setelah share_plus downgrade, skip..."
+                    continue
+                  fi
+                  echo "pub get OK setelah share_plus downgrade"
+                else
+                  XML_CONFLICT=$(grep -c "is incompatible with.*xml\|xml.*incompatible with" "$PUB_LOG" 2>/dev/null || true)
+                  if [ "${XML_CONFLICT:-0}" -gt 0 ]; then
+                    echo "💀 FATAL: xml version conflict — better_player vs youtube_explode_dart tidak compatible"
+                    echo "Cek dependency_overrides xml sudah di-inject. Jika masih gagal, salah satu package perlu diupdate."
+                    SUCCESS=fatal_xml
+                    break 2
+                  fi
+
+                  if [ "$PUB_EXIT" -eq 69 ]; then
+                    echo "⚠️ pub get exit 69 (network error) — pub.dart.dev tidak reachable, retry dalam 5s..."
+                    sleep 5
+                    fvm flutter pub get 2>&1 | tee "$PUB_LOG"
+                    PUB_EXIT=${PIPESTATUS[0]}
+                    [ $PUB_EXIT -ne 0 ] && { echo "pub get masih gagal setelah retry, skip..."; continue; }
+                    echo "pub get OK setelah retry"
+                  fi
+
+                  if [ "$PUB_EXIT" -eq 65 ]; then
+                    echo "⚠️ pub get exit 65 (ToolExit) — kemungkinan SDK constraint conflict atau pubspec corrupt"
+                    echo "Detail dari pub log:"
+                    grep -E "Because|depends on|version solving|sdk|flutter" "$PUB_LOG" | head -8 ||                       tail -10 "$PUB_LOG"
+                    continue
+                  fi
+
+                  handle_pkg_conflicts "$PUB_LOG" || continue
+
+                  handle_web_http_conflict "$PUB_LOG" || continue
+
+                  handle_exact_ver_conflict "$PUB_LOG" || continue
+
+                                    WIN32_DIP_CONFLICT=$(grep -cE                     "device_info_plus.*incompatible|incompatible.*device_info_plus|package_info_plus.*incompatible.*device_info_plus|network_info_plus.*incompatible|incompatible.*network_info_plus|wakelock_plus.*incompatible|version solving failed"                     "$PUB_LOG" 2>/dev/null || true)
+                  if [ "${WIN32_DIP_CONFLICT:-0}" -gt 0 ]; then
+                    NIP_PIP_C=$(grep -cE "network_info_plus.*package_info_plus|package_info_plus.*network_info_plus" "$PUB_LOG" 2>/dev/null || true)
+                    if [ "${NIP_PIP_C:-0}" -gt 0 ]; then
+                      echo "⚠️ nip+pip win32 tier conflict — pip ke 9.x + nip ke win32 5.x range..."
+                      python3 pyhelper.py pin_pkg "package_info_plus" '">=9.0.0 <10.0.0"'
+                      python3 pyhelper.py pin_pkg "network_info_plus" '">=4.0.0 <8.0.0"'
+                    else
+                      echo "⚠️ win32/dip conflict — dip ke 11.x..."
+                      python3 pyhelper.py pin_pkg "device_info_plus" '">=11.0.0"'
+                    fi
+                    refresh_local_properties
+                    fvm flutter pub get 2>&1 | tee "$PUB_LOG"
+                    PUB_EXIT=${PIPESTATUS[0]}
+                    if [ $PUB_EXIT -eq 0 ]; then
+                      echo "pub get OK setelah win32 conflict fix"
+                    else
+                      echo "pub get masih gagal, skip..."
+                      tail -5 "$PUB_LOG"; continue
+                    fi
+                  else
+                    echo "flutter pub get gagal (exit $PUB_EXIT), detail:"
+                    grep -E "Because|incompatible|version solving" "$PUB_LOG" | head -5 || true
+                    continue
+                  fi
+                fi
+              fi
+
+              refresh_local_properties
+
+              BUILD_LOG=$(mktemp)
+              fvm flutter build apk --release --no-tree-shake-icons \
+                --android-skip-build-dependency-validation 2>&1 | tee "$BUILD_LOG"
+              BUILD_EXIT=${PIPESTATUS[0]}
+
+              if [ $BUILD_EXIT -eq 0 ]; then
+                echo "✅ BUILD BERHASIL dengan Flutter $FLUTTER_VER + font_awesome_flutter $FA_VER"
+                SUCCESS=true
+                FLUTTER_VERSION_USED="$FLUTTER_VER"
+                FA_VERSION_USED="$FA_VER"
+                break
+              fi
+
+              DART_SRC_SYNTAX=$(grep -cE \
+                "^lib/.+\.dart:[0-9]+:[0-9]+: Error: (Variables must be declared|Expected [^a-z]|Unexpected (token|character)|Expected a declaration|Couldn't find constructor)" \
+                "$BUILD_LOG" 2>/dev/null || true)
+              if [ "${DART_SRC_SYNTAX:-0}" -gt 0 ]; then
+                echo ""
+                echo "💀 FATAL: Dart source syntax error di project — retry Flutter/FA version tidak akan help"
+                grep -E "^lib/.+\.dart:[0-9]+:[0-9]+: Error:" "$BUILD_LOG" | head -10
+                echo ""
+                echo "Periksa import statements / syntax di file dart yang error di atas"
+                SUCCESS=fatal_dart
+                break
+              fi
+
+              ICONDATA_ERR=$(grep -cE "IconData.*can't be extended|can't be extended.*because it's a final class" \
+                "$BUILD_LOG" 2>/dev/null || true)
+              if [ "${ICONDATA_ERR:-0}" -gt 0 ]; then
+                echo "⚠️ Flutter $FLUTTER_VER: IconData final class — semua FA versions tidak bisa extend IconData di Flutter >=3.27"
+                echo "   Skip Flutter $FLUTTER_VER, coba Flutter versi lebih lama (3.38.x/3.35.x) yang IconData belum final..."
+                break
+              fi
+
+              if [ "$APPLY_PH_OVERRIDE" != true ]; then
+                PH_SDK_ERR=$(grep -cE "permission_handler_android requires Android SDK|permission_handler_android:compileRelease.*Platform SDK" \
+                  "$BUILD_LOG" || true)
+                if [ "${PH_SDK_ERR:-0}" -gt 0 ]; then
+                  echo "permission_handler_android minta SDK — apply override..."
+                  APPLY_PH_OVERRIDE=true
+                  pin_safe_overrides
+                  refresh_local_properties
+                  fvm flutter pub get 2>&1 | tee "$PUB_LOG"
+                  refresh_local_properties
+                  fvm flutter build apk --release --no-tree-shake-icons \
+                    --android-skip-build-dependency-validation 2>&1 | tee "$BUILD_LOG"
+                  BUILD_EXIT=${PIPESTATUS[0]}
+                  if [ $BUILD_EXIT -eq 0 ]; then
+                    echo "✅ BUILD BERHASIL setelah override permission_handler_android"
+                    SUCCESS=true; FLUTTER_VERSION_USED="$FLUTTER_VER"; FA_VERSION_USED="$FA_VER"
+                    break
+                  fi
+                fi
+              fi
+
+              REQ_MIN=$(grep -oE "cannot be smaller than version [0-9]+" "$BUILD_LOG" \
+                | grep -oE "[0-9]+" | head -1)
+              if [ -n "$REQ_MIN" ]; then
+                echo "Auto-patch minSdk -> $REQ_MIN"
+                python3 pyhelper.py patch_minsdk "$REQ_MIN"
+                refresh_local_properties
+                fvm flutter build apk --release --no-tree-shake-icons \
+                  --android-skip-build-dependency-validation 2>&1 | tee "$BUILD_LOG"
+                BUILD_EXIT=${PIPESTATUS[0]}
+                if [ $BUILD_EXIT -eq 0 ]; then
+                  echo "✅ BUILD BERHASIL setelah minSdk patch"
+                  SUCCESS=true; FLUTTER_VERSION_USED="$FLUTTER_VER"; FA_VERSION_USED="$FA_VER"
+                  break
+                fi
+              fi
+
+              HAS_SDK_ERR=$(grep -cE "Failed to find Platform SDK|compiles against Android SDK [0-9]+" \
+                "$BUILD_LOG" || true)
+              if [ "${HAS_SDK_ERR:-0}" -gt 0 ]; then
+                echo "Detected SDK error, auto-fix..."
+                fix_sdk "$BUILD_LOG"
+                refresh_local_properties
+                fvm flutter build apk --release --no-tree-shake-icons \
+                  --android-skip-build-dependency-validation 2>&1 | tee "$BUILD_LOG"
+                BUILD_EXIT=${PIPESTATUS[0]}
+                if [ $BUILD_EXIT -eq 0 ]; then
+                  echo "✅ BUILD BERHASIL setelah SDK fix"
+                  SUCCESS=true; FLUTTER_VERSION_USED="$FLUTTER_VER"; FA_VERSION_USED="$FA_VER"
+                  break
+                fi
+              fi
+
+              NIP_API_ERR=$(grep -cE                 "network_info_plus.*(AF_INET6|AF_INET|inet_ntop|isError|Too few positional)"                 "$BUILD_LOG" 2>/dev/null || true)
+              if [ "${NIP_API_ERR:-0}" -gt 0 ]; then
+                echo "⚠️ network_info_plus 8.x API mismatch — downgrade ke <8.0.0..."
+                python3 pyhelper.py pin_pkg "network_info_plus" '">=4.0.0 <8.0.0"'
+                fvm flutter pub get 2>&1 | tee "$PUB_LOG"
+                PUB_EXIT=${PIPESTATUS[0]}
+                if [ $PUB_EXIT -eq 0 ]; then
+                  fvm flutter build apk --release --no-tree-shake-icons                     --android-skip-build-dependency-validation 2>&1 | tee "$BUILD_LOG"
+                  BUILD_EXIT=${PIPESTATUS[0]}
+                  if [ $BUILD_EXIT -eq 0 ]; then
+                    echo "✅ BUILD BERHASIL setelah network_info_plus downgrade"
+                    SUCCESS=true; FLUTTER_VERSION_USED="$FLUTTER_VER"; FA_VERSION_USED="$FA_VER"
+                    break
+                  fi
+                fi
+              fi
+
+              INCOMPAT=$(grep -cE "can't be (extended|implemented|mixed in) outside of its library|Error: The (method|getter|setter|class|argument) .* (isn't defined|can't be)" \
+                "$BUILD_LOG" || true)
+              if [ "${INCOMPAT:-0}" -gt 0 ]; then
+                echo "Incompatibility terdeteksi, flutter pub upgrade..."
+                fvm flutter pub upgrade
+                fix_sdk "$BUILD_LOG" || true
+                refresh_local_properties
+                fvm flutter build apk --release --no-tree-shake-icons \
+                  --android-skip-build-dependency-validation 2>&1 | tee "$BUILD_LOG"
+                BUILD_EXIT=${PIPESTATUS[0]}
+                if [ $BUILD_EXIT -eq 0 ]; then
+                  echo "✅ BUILD BERHASIL setelah pub upgrade"
+                  SUCCESS=true; FLUTTER_VERSION_USED="$FLUTTER_VER"; FA_VERSION_USED="$FA_VER"
+                  break
+                fi
+              fi
+
+              HAS_SDK_ERR2=$(grep -cE "Failed to find Platform SDK|compiles against Android SDK [0-9]+" \
+                "$BUILD_LOG" || true)
+              if [ "${HAS_SDK_ERR2:-0}" -gt 0 ]; then
+                echo "SDK error catch-all..."
+                fix_sdk "$BUILD_LOG" || true
+                refresh_local_properties
+                fvm flutter build apk --release --no-tree-shake-icons \
+                  --android-skip-build-dependency-validation 2>&1 | tee "$BUILD_LOG"
+                BUILD_EXIT=${PIPESTATUS[0]}
+                if [ $BUILD_EXIT -eq 0 ]; then
+                  echo "✅ BUILD BERHASIL setelah SDK catch-all"
+                  SUCCESS=true; FLUTTER_VERSION_USED="$FLUTTER_VER"; FA_VERSION_USED="$FA_VER"
+                  break
+                fi
+              fi
+
+              if grep -q "OutOfMemoryError" "$BUILD_LOG" 2>/dev/null; then
+                echo "OOM terdeteksi, naikkan memory..."
+                echo "org.gradle.parallel=false" >> android/gradle.properties
+                echo "org.gradle.workers.max=2" >> android/gradle.properties
+                echo "org.gradle.configureondemand=false" >> android/gradle.properties
+                sed -i '/org.gradle.jvmargs/d' android/gradle.properties
+                echo "org.gradle.jvmargs=-Xmx5g -XX:MaxMetaspaceSize=3g -XX:+UseG1GC" >> android/gradle.properties
+                refresh_local_properties
+                fvm flutter build apk --release --no-tree-shake-icons \
+                  --android-skip-build-dependency-validation 2>&1 | tee "$BUILD_LOG"
+                BUILD_EXIT=${PIPESTATUS[0]}
+                if [ $BUILD_EXIT -eq 0 ]; then
+                  echo "✅ BUILD BERHASIL setelah OOM fix"
+                  SUCCESS=true; FLUTTER_VERSION_USED="$FLUTTER_VER"; FA_VERSION_USED="$FA_VER"
+                  break
+                fi
+              fi
+
+              GRADLE9_ERR=$(grep -cE                 "InternalProblems.*removed in Gradle|relies on.*internal API.*removed in Gradle|agp_8x_incompatible"                 "$BUILD_LOG" 2>/dev/null || true)
+              if [ "${GRADLE9_ERR:-0}" -gt 0 ]; then
+                echo "⚠️ AGP incompatible dengan Gradle 9.6+ — force wrapper ke Gradle 8.13..."
+                find . -name "gradle-wrapper.properties" -exec                   sed -i -E 's#distributionUrl=.*#distributionUrl=https\://services.gradle.org/distributions/gradle-8.13-all.zip#' {} \;
+                if ! find . -name "gradle-wrapper.properties" -print -quit 2>/dev/null | grep -q .; then
+                  mkdir -p android/gradle/wrapper
+                  printf 'distributionBase=GRADLE_USER_HOME\ndistributionPath=wrapper/dists\ndistributionUrl=https\\://services.gradle.org/distributions/gradle-8.13-all.zip\nnetworkTimeout=10000\nvalidateDistributionUrl=true\nzipStoreBase=GRADLE_USER_HOME\nzipStorePath=wrapper/dists\n'                     > android/gradle/wrapper/gradle-wrapper.properties
+                fi
+                refresh_local_properties
+                fvm flutter build apk --release --no-tree-shake-icons                   --android-skip-build-dependency-validation 2>&1 | tee "$BUILD_LOG"
+                BUILD_EXIT=${PIPESTATUS[0]}
+                if [ $BUILD_EXIT -eq 0 ]; then
+                  echo "✅ BUILD BERHASIL setelah Gradle 8.13 wrapper fix"
+                  SUCCESS=true; FLUTTER_VERSION_USED="$FLUTTER_VER"; FA_VERSION_USED="$FA_VER"
+                  break
+                fi
+              fi
+
+              KOTLIN_ERR=$(grep -cE "Unresolved reference.*compilerOptions|kgpVersion|KgpUtils|incompatible version of Kotlin|metadata version" \
+                "$BUILD_LOG" 2>/dev/null || true)
+              if [ "${KOTLIN_ERR:-0}" -gt 0 ]; then
+                echo "Kotlin incompatibility terdeteksi..."
+                DETECTED_KOTLIN=$(grep -oE "kotlin-stdlib-[0-9]+\.[0-9]+\.[0-9]+" "$BUILD_LOG" \
+                  | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | sort -V | tail -1)
+                if [ -n "$DETECTED_KOTLIN" ]; then
+                  python3 pyhelper.py patch_settings "android/settings.gradle.kts" "8.9.1" "$DETECTED_KOTLIN"
+                else
+                  python3 pyhelper.py patch_settings "android/settings.gradle.kts" "8.9.1" "2.1.0"
+                fi
+                pin_safe_overrides
+                fvm flutter pub get 2>/dev/null || true
+                refresh_local_properties
+                fvm flutter build apk --release --no-tree-shake-icons \
+                  --android-skip-build-dependency-validation 2>&1 | tee "$BUILD_LOG"
+                BUILD_EXIT=${PIPESTATUS[0]}
+                if [ $BUILD_EXIT -eq 0 ]; then
+                  echo "✅ BUILD BERHASIL setelah Kotlin fix"
+                  SUCCESS=true; FLUTTER_VERSION_USED="$FLUTTER_VER"; FA_VERSION_USED="$FA_VER"
+                  break
+                fi
+              fi
+
+              echo "❌ BUILD GAGAL dengan Flutter $FLUTTER_VER + font_awesome_flutter $FA_VER"
+              grep -E "^lib/.*Error:" "$BUILD_LOG" | head -15 \
+                || echo "(tidak ada error compile Dart spesifik)"
+              ERROR_MSG=$(tail -30 "$BUILD_LOG" | grep -E "Error:|FAILURE:|error:" | grep -v "^#" | head -3 || true)
+              if [ -z "$ERROR_MSG" ]; then
+                ERROR_MSG=$(tail -5 "$BUILD_LOG" | tr '\n' ' ')
+              fi
+              echo "Last error: $ERROR_MSG"
+            done
+
+            if [ "$SUCCESS" = "fatal_dart" ] || [ "$SUCCESS" = "fatal_xml" ]; then
+              echo "❌ BUILD DIHENTIKAN — structural dependency conflict, tidak dilanjut ke Flutter version lain"
+              break
+            fi
+
+            if [ "$SUCCESS" = true ]; then
+              break
+            fi
+
+            echo "Cleanup Flutter $FLUTTER_VER (hemat disk)..."
+            rm -rf "$FVM_CACHE_DIR/$FLUTTER_VER" "$PROJECT_ROOT/android/.gradle" ~/.gradle/caches/transforms-* 2>/dev/null
+            df -h / | tail -1
+
+            if [ "${ICONDATA_FA_COUNT:-0}" -ge "${FA_TOTAL:-4}" ]; then
+              echo "⚠️ Flutter $FLUTTER_VER: semua FA versions IconData conflict — skip, coba Flutter lebih lama"
+              continue
+            fi
+
+            echo "❌ BUILD GAGAL dengan Flutter $FLUTTER_VER"
+            echo "Trying next Flutter version..."
+          done
+
+          if [ "$SUCCESS" = "fatal_dart" ]; then
+            echo ""
+            echo "❌ BUILD GAGAL karena Dart source syntax error di project"
+            echo "Fix: periksa file dart yang error (lihat log di atas), pastikan semua import statements benar"
+            exit 1
+          fi
+
+          if [ "$SUCCESS" = "fatal_xml" ]; then
+            echo ""
+            echo "❌ BUILD GAGAL karena xml version conflict antar dependencies"
+            echo "Fix: pastikan dependency_overrides xml sudah ter-inject, atau update better_player"
+            exit 1
+          fi
+
+          if [ "$SUCCESS" = false ]; then
+            echo ""
+            echo "❌ SEMUA VERSI FLUTTER GAGAL"
+            echo "Versi yang dicoba: $CANDIDATES"
+            exit 1
+          fi
+
+          echo "flutter_version_used=$FLUTTER_VERSION_USED" >> $GITHUB_OUTPUT
+          echo "fa_version_used=$FA_VERSION_USED" >> $GITHUB_OUTPUT
+
+      - name: Upload Artifact
+        if: steps.build_retry.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: ${{ env.PROJECT_ROOT }}/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 7
+
+      - name: Build Success Summary
+        if: steps.build_retry.outcome == 'success'
+        run: |
+          echo "✅ BUILD BERHASIL"
+          echo "Flutter Version: ${{ steps.build_retry.outputs.flutter_version_used }}"
+          echo "font_awesome_flutter Version: ${{ steps.build_retry.outputs.fa_version_used }}"
+          echo "APK Path: ${{ env.PROJECT_ROOT }}/build/app/outputs/flutter-apk/app-release.apk"
