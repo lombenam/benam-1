@@ -1,4 +1,4 @@
-name: Build
+name: Build benam
 
 on:
   workflow_call:
@@ -29,27 +29,17 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: read
+      actions: write
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GH_PAT }}
-
-      - name: Free Disk Space
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
-            /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL \
-            /usr/local/.ghcup /usr/share/swift
-          sudo apt-get clean
-          docker system prune -af || true
-          df -h /
 
       - name: Download Project ZIP
         run: |
           URL=$(echo '${{ inputs.payload }}' | jq -r '.zipAssetUrl')
           curl -L \
-            -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/octet-stream" \
             -o project.zip "$URL"
 
@@ -1365,10 +1355,6 @@ jobs:
               break
             fi
 
-            echo "Cleanup Flutter $FLUTTER_VER (hemat disk)..."
-            rm -rf "$FVM_CACHE_DIR/$FLUTTER_VER" "$PROJECT_ROOT/android/.gradle" ~/.gradle/caches/transforms-* 2>/dev/null
-            df -h / | tail -1
-
             if [ "${ICONDATA_FA_COUNT:-0}" -ge "${FA_TOTAL:-4}" ]; then
               echo "⚠️ Flutter $FLUTTER_VER: semua FA versions IconData conflict — skip, coba Flutter lebih lama"
               continue
@@ -1388,7 +1374,7 @@ jobs:
           if [ "$SUCCESS" = "fatal_xml" ]; then
             echo ""
             echo "❌ BUILD GAGAL karena xml version conflict antar dependencies"
-            echo "Fix: pastikan dependency_overrides xml sudah ter-inject, atau update better_player"
+            echo "Fix: pastikan dependency_overrides xml sudah ter-inject, atau update better_player/youtube_explode_dart"
             exit 1
           fi
 
@@ -1409,6 +1395,23 @@ jobs:
           name: apk-${{ inputs.jobId }}
           path: ${{ env.PROJECT_ROOT }}/build/app/outputs/flutter-apk/app-release.apk
           retention-days: 7
+
+      - name: Auto Delete Run
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          USER_ID: ${{ inputs.userId }}
+          OWNER_ID: ${{ secrets.OWNER_TELEGRAM_ID }}
+        run: |
+          if [ "$USER_ID" = "$OWNER_ID" ]; then
+            echo "Owner yang build — run TIDAK dihapus"
+            exit 0
+          fi
+          echo "Non Owner — hapus run setelah selesai..."
+          sleep 10
+          gh api --method DELETE \
+            "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            2>/dev/null && echo "Run dihapus" || echo "Gagal hapus run" 
 
       - name: Build Success Summary
         if: steps.build_retry.outcome == 'success'
