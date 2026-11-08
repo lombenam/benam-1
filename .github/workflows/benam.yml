@@ -778,6 +778,37 @@ jobs:
                   f.write(uc)
               print(f"pubspec.yaml diupdate dengan {len(overrides)} dependency_overrides")
 
+          def add_missing_imports():
+              pubspec_path = "pubspec.yaml"
+              if not os.path.exists(pubspec_path) or not os.path.isdir("lib"):
+                  return
+              with open(pubspec_path) as f:
+                  content = f.read()
+              m = re.search(r'^name:\s*(\S+)', content, re.M)
+              own = m.group(1) if m else ""
+              skip = {"flutter", "flutter_test", "flutter_localizations",
+                      "flutter_web_plugins", "integration_test", own}
+              used = set()
+              for root, _, files in os.walk("lib"):
+                  for fn in files:
+                      if fn.endswith(".dart"):
+                          try:
+                              src = open(os.path.join(root, fn), errors="ignore").read()
+                          except Exception:
+                              continue
+                          used.update(re.findall(r"import\s+['\"]package:([a-zA-Z0-9_]+)/", src))
+                          used.update(re.findall(r"export\s+['\"]package:([a-zA-Z0-9_]+)/", src))
+              missing = [p for p in sorted(used - skip)
+                         if not re.search(rf'^\s+{re.escape(p)}\s*:', content, re.M)]
+              if not missing:
+                  return
+              entries = "".join(f"  {p}: any\n" for p in missing)
+              content = re.sub(r'(^dependencies:\s*\n)', lambda mm: mm.group(1) + entries,
+                               content, count=1, flags=re.M)
+              with open(pubspec_path, "w") as f:
+                  f.write(content)
+              print(f"Auto-added missing dependencies: {missing}")
+          
           if __name__ == "__main__":
               cmd = sys.argv[1]
               args = sys.argv[2:]
@@ -797,6 +828,8 @@ jobs:
                   patch_compile_sdk(*args)
               elif cmd == "patch_minsdk":
                   patch_minsdk(*args)
+              elif cmd == "add_missing_imports":
+                  add_missing_imports()
               elif cmd == "downgrade_packages":
                   downgrade_packages(*args)
 
@@ -1040,6 +1073,7 @@ jobs:
             fi
             cp pubspec.yaml.orig_backup pubspec.yaml
             rm -f pubspec.lock
+            python3 pyhelper.py add_missing_imports
 
             if [ ! -d "$FVM_CACHE_DIR/$FLUTTER_VER" ]; then
               echo "Flutter $FLUTTER_VER tidak ada di cache, skip..."
