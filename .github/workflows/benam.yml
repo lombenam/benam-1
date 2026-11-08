@@ -978,6 +978,35 @@ jobs:
           chmod +x build_funcs.sh
           echo "build_funcs.sh ditulis di: $(pwd)/build_funcs.sh ($(wc -c < build_funcs.sh) bytes)"
 
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/pubspec.yaml') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Gradle network hardening
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat >> ~/.gradle/gradle.properties <<'EOF'
+          systemProp.org.gradle.internal.http.connectionTimeout=60000
+          systemProp.org.gradle.internal.http.socketTimeout=180000
+          systemProp.org.gradle.internal.repository.max.retries=6
+          systemProp.org.gradle.internal.repository.initial.backoff=2000
+          EOF
+          cat > ~/.gradle/init.d/mirror.gradle <<'EOF'
+          def mirror = "https://maven-central.storage-download.googleapis.com/maven2/"
+          beforeSettings { settings ->
+            settings.pluginManagement.repositories { maven { url mirror } }
+          }
+          allprojects {
+            buildscript.repositories { maven { url mirror } }
+            repositories { maven { url mirror } }
+          }
+          EOF
+      
       - name: Build with Flutter Version Pool Retry
         id: build_retry
         timeout-minutes: 85
@@ -1337,8 +1366,28 @@ jobs:
                 fi
               fi
 
+              NET_RE="Received status code 5[0-9][0-9]|Gateway Time-out|Read timed out|Connect timed out|Connection reset|Premature end of Content-Length"
+              for NET_TRY in 1 2 3; do
+                grep -qE "$NET_RE" "$BUILD_LOG" || break
+                WAIT=$((NET_TRY * 45))
+                echo "🌐 Network error Gradle, retry $NET_TRY/3 setelah ${WAIT}s (Flutter tidak diganti)..."
+                sleep $WAIT
+                fvm flutter build apk --release --no-tree-shake-icons \
+                  --android-skip-build-dependency-validation 2>&1 | tee "$BUILD_LOG"
+                if [ ${PIPESTATUS[0]} -eq 0 ]; then
+                  SUCCESS=true; FLUTTER_VERSION_USED="$FLUTTER_VER"; FA_VERSION_USED="$FA_VER"
+                  break
+                fi
+              done
+              [ "$SUCCESS" = true ] && break
+
+              if grep -qE "$NET_RE" "$BUILD_LOG"; then
+                echo "❌ Jaringan Maven/GitHub masih bermasalah setelah 3x retry, bukan salah project. Stop, rebuild nanti."
+                exit 1
+              fi
+              
               echo "❌ BUILD GAGAL dengan Flutter $FLUTTER_VER + font_awesome_flutter $FA_VER"
-              DART_ERRORS=$(grep -E "^lib/.*Error:" "$BUILD_LOG" | head -15 || true)
+              DART_ERRORS=$(grep -E "\.dart:[0-9]+:[0-9]+: Error:" "$BUILD_LOG" | head -15 || true)
               ANDROID_ERRORS=$(grep -E "(android/|assets/|pubspec\.yaml).*(Error|error|FAILURE)" "$BUILD_LOG" | head -10 || true)
               BUILD_ERRORS=$(grep -E "(Execution failed for task|FAILURE: Build failed|> What went wrong:|> Could not resolve|No file or variant found)" "$BUILD_LOG" | head -10 || true)
 
