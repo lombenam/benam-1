@@ -1338,8 +1338,16 @@ jobs:
               fi
 
               echo "❌ BUILD GAGAL dengan Flutter $FLUTTER_VER + font_awesome_flutter $FA_VER"
-              grep -E "^lib/.*Error:" "$BUILD_LOG" | head -15 \
-                || echo "(tidak ada error compile Dart spesifik)"
+              DART_ERRORS=$(grep -E "^lib/.*Error:" "$BUILD_LOG" | head -15 || true)
+              ANDROID_ERRORS=$(grep -E "(android/|assets/|pubspec\.yaml).*(Error|error|FAILURE)" "$BUILD_LOG" | head -10 || true)
+              BUILD_ERRORS=$(grep -E "(Execution failed for task|FAILURE: Build failed|> What went wrong:|> Could not resolve|No file or variant found)" "$BUILD_LOG" | head -10 || true)
+
+              FOUND_ANY=false
+              [ -n "$DART_ERRORS" ]    && echo "$DART_ERRORS"    && FOUND_ANY=true
+              [ -n "$ANDROID_ERRORS" ] && echo "$ANDROID_ERRORS" && FOUND_ANY=true
+              [ -n "$BUILD_ERRORS" ]   && echo "$BUILD_ERRORS"   && FOUND_ANY=true
+              [ "$FOUND_ANY" = false ] && echo "(tidak ada error compile Dart spesifik)"
+
               ERROR_MSG=$(tail -30 "$BUILD_LOG" | grep -E "Error:|FAILURE:|error:" | grep -v "^#" | head -3 || true)
               if [ -z "$ERROR_MSG" ]; then
                 ERROR_MSG=$(tail -5 "$BUILD_LOG" | tr '\n' ' ')
